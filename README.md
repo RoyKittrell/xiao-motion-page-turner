@@ -15,6 +15,12 @@ The remote is tuned for natural reading gestures rather than button presses:
 The firmware currently targets Apple Books on iPadOS by presenting itself as a
 Bluetooth HID keyboard and sending left/right arrow keys.
 
+## Demo
+
+<p align="center">
+  <img src="page-turner-demo.gif" alt="Gesture-controlled page turner demonstration" width="360">
+</p>
+
 ## Hardware
 
 - Seeed Studio XIAO nRF52840 Sense
