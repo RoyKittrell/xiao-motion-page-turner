@@ -73,7 +73,7 @@ User-facing settings are grouped near the top of the sketch. They include:
 
 - Bluetooth name
 - Reversed or original page direction
-- Active-session duration
+- Motion-inactivity timeout and activity thresholds
 - Page-turn sensitivity
 - Shake-to-wake thresholds and timing
 - LED timing
@@ -82,6 +82,10 @@ User-facing settings are grouped near the top of the sketch. They include:
 
 The included defaults were trained from recorded natural page turns, five
 deliberate wake shakes, and approximately 79 seconds of pocket walking.
+
+After five continuous minutes without meaningful movement, the remote parks
+regardless of its resting orientation. Page gestures stay disabled until the
+trained three-impulse shake wakes it again.
 
 ## Motion Recorder
 
