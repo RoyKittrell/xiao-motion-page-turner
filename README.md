@@ -20,7 +20,6 @@ Bluetooth HID keyboard and sending left/right arrow keys.
 - Seeed Studio XIAO nRF52840 Sense
 - Protected single-cell 3.7 V LiPo battery (prototype uses 402530, 300 mAh)
 - USB-C cable for programming and charging
-- Optional 3D-printed enclosure from `hardware/enclosure/`
 
 The gesture-only build does not require external buttons. The onboard LSM6DS3
 IMU provides motion sensing.
@@ -78,12 +77,6 @@ User-facing settings are grouped near the top of the sketch. They include:
 The included defaults were trained from recorded natural page turns, five
 deliberate wake shakes, and approximately 79 seconds of pocket walking.
 
-## Enclosure
-
-`hardware/enclosure/` contains the latest prototype front, back, and button-fit
-coupon as millimetre-scale STL files. These parts have not yet been physically
-fit-verified. Print the coupon first and treat the enclosure as experimental.
-
 ## Motion Recorder
 
 `tools/Motion_Recorder/` contains the data-collection sketch used to tune wake
@@ -100,7 +93,4 @@ nRF52840 into genuine low-power sleep between wake events.
 
 ## License
 
-Firmware and documentation are released under the MIT License. Prototype STL
-files are released under Creative Commons Attribution 4.0; see
-`hardware/enclosure/LICENSE`.
-
+Firmware and documentation are released under the MIT License.
