@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.13 - 2026-09-29
+
+- Replaced orientation-specific table detection with motion inactivity parking.
+- Parks after five continuous minutes without meaningful movement.
+- Requires the trained three-impulse shake to wake after parking.
+
 ## 1.12 - 2026-09-29
 
 - Added persistent face-down Bluetooth handoff mode.
@@ -30,4 +36,3 @@
 
 - Added reversed, paper-like page-turn direction.
 - Extended active reading sessions to five minutes.
-
