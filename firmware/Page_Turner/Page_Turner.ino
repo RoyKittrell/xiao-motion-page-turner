@@ -1,4 +1,4 @@
-// Page Turner V1.12 - persistent face-down Bluetooth handoff mode
+// Page Turner V1.13 - motion-inactivity parking
 #include <bluefruit.h>
 #include <LSM6DS3.h>
 #include <Wire.h>
@@ -21,12 +21,15 @@ constexpr char BLUETOOTH_NAME[] = "Roy's Page Turner";
 // false: use the original gesture-to-arrow mapping.
 constexpr bool REVERSE_PAGE_DIRECTION = true;
 
-// The remote cannot park during this reading window. Every successful page
-// turn restarts the timer. Increase this for slower reading sessions.
-constexpr uint32_t ACTIVE_TIME_MINUTES = 5;
+// Park after this many continuous minutes without meaningful movement.
+// Picking it up, shifting it, or turning a page restarts the timer. Once
+// parked, page gestures remain disabled until the deliberate shake-to-wake.
+constexpr uint32_t MOTION_INACTIVITY_MINUTES = 5;
 
-// How long it must remain in the parked orientation after the reading window.
-constexpr uint32_t PARK_CONFIRM_SECONDS = 3;
+// Movement must cross either threshold to restart the inactivity timer.
+// These are deliberately above normal stationary IMU noise.
+constexpr float ACTIVITY_GYRO_THRESHOLD_DPS = 12.0f;
+constexpr float ACTIVITY_ACCEL_DELTA_G = 0.12f;
 
 // After the wake flashes, motion is ignored until calmly held for this long.
 constexpr uint32_t PICKUP_SETTLE_MS = 400;
@@ -94,9 +97,8 @@ constexpr bool SHOW_MOTION_SERIAL_STATUS = false;
 
 constexpr float QUIET_THRESHOLD_DPS = 40.0f;
 constexpr uint32_t QUIET_TO_ARM_MS = 250;
-constexpr float TABLE_X_MAX_G = 0.08f;
 constexpr float HELD_X_MIN_G = 0.15f;
-constexpr float TABLE_GYRO_MAX_DPS = 8.0f;
+constexpr float SETTLE_GYRO_MAX_DPS = 8.0f;
 constexpr float LEARNING_RATE = 0.02f;
 constexpr float MIN_TURN_THRESHOLD_DPS = 350.0f;
 constexpr float MAX_TURN_THRESHOLD_DPS = 450.0f;
@@ -108,8 +110,8 @@ constexpr float FACE_DOWN_Z_MAX_G = -0.65f;
 constexpr float FACE_DOWN_GYRO_MAX_DPS = 80.0f;
 
 // Derived timing values. Do not edit these; use the settings above.
-constexpr uint32_t TABLE_CONFIRM_MS = PARK_CONFIRM_SECONDS * 1000UL;
-constexpr uint32_t ACTIVE_HOLD_MS = ACTIVE_TIME_MINUTES * 60UL * 1000UL;
+constexpr uint32_t MOTION_INACTIVITY_MS =
+    MOTION_INACTIVITY_MINUTES * 60UL * 1000UL;
 constexpr uint32_t BATTERY_STATUS_INTERVAL_MS =
     BATTERY_STATUS_INTERVAL_SECONDS * 1000UL;
 constexpr uint32_t HANDOFF_WINDOW_MS = HANDOFF_WINDOW_SECONDS * 1000UL;
@@ -175,10 +177,9 @@ void onBleSecured(uint16_t connHandle);
 
 bool gestureArmed = false;
 uint32_t quietSince = 0;
-uint32_t tableSince = 0;
 uint32_t pickupQuietSince = 0;
 uint32_t readyFlashStartedAt = 0;
-uint32_t activeHoldStartedAt = 0;
+uint32_t lastMeaningfulMotionAt = 0;
 uint32_t lastPrintAt = 0;
 uint32_t lastBatteryPrintAt = 0;
 uint32_t faceDownSince = 0;
@@ -740,8 +741,8 @@ void startAdvertising() {
 }
 
 void sendArrow(uint8_t key, const char *label) {
-  // Every intentional page turn starts a fresh five-minute reading window.
-  activeHoldStartedAt = millis();
+  // An intentional page turn is meaningful activity.
+  lastMeaningfulMotionAt = millis();
 
   if (!Bluefruit.connected()) {
     diagnostics.println("Gesture recognized; iPad not connected");
@@ -799,7 +800,7 @@ void setup() {
   bleUart.begin();
   startAdvertising();
 
-  diagnostics.println("Roy Page Turner V1.12 ready");
+  diagnostics.println("Roy Page Turner V1.13 ready");
   if (Serial) {
     printBatteryStatus();
   }
@@ -816,8 +817,9 @@ void loop() {
   const uint32_t now = millis();
   const float gyroMagnitude = sqrtf(gx * gx + gy * gy + gz * gz);
   const float accelMagnitude = sqrtf(ax * ax + ay * ay + az * az);
-  const bool tableLike = fabs(ax) <= TABLE_X_MAX_G &&
-                         gyroMagnitude <= TABLE_GYRO_MAX_DPS;
+  const bool meaningfulMotion =
+      gyroMagnitude >= ACTIVITY_GYRO_THRESHOLD_DPS ||
+      fabsf(accelMagnitude - 1.0f) >= ACTIVITY_ACCEL_DELTA_G;
 
   const bool calmlyFaceDown = ENABLE_FACE_DOWN_HANDOFF &&
                               az <= FACE_DOWN_Z_MAX_G &&
@@ -872,7 +874,7 @@ void loop() {
       diagnostics.println("State: SETTLING (gestures ignored)");
     }
   } else if (remoteState == RemoteState::PICKUP_SETTLING) {
-    const bool calmlyHeld = gyroMagnitude <= TABLE_GYRO_MAX_DPS;
+    const bool calmlyHeld = gyroMagnitude <= SETTLE_GYRO_MAX_DPS;
     if (calmlyHeld) {
       if (pickupQuietSince == 0) {
         pickupQuietSince = now;
@@ -880,31 +882,23 @@ void loop() {
         remoteState = RemoteState::READY;
         gestureArmed = true;
         quietSince = now;
-        tableSince = 0;
         readyFlashStartedAt = now;
-        activeHoldStartedAt = now;
+        lastMeaningfulMotionAt = now;
         diagnostics.println("State: READY");
       }
     } else {
       pickupQuietSince = 0;
     }
   } else {
-    const bool activeWindowComplete =
-        now - activeHoldStartedAt >= ACTIVE_HOLD_MS;
-
-    if (activeWindowComplete && tableLike) {
-      if (tableSince == 0) {
-        tableSince = now;
-      } else if (now - tableSince >= TABLE_CONFIRM_MS) {
-        remoteState = RemoteState::PARKED;
-        gestureArmed = false;
-        quietSince = 0;
-        resetSessionLearning();
-        resetWakeDetector();
-        diagnostics.println("State: PARKED (page gestures disabled)");
-      }
-    } else {
-      tableSince = 0;
+    if (meaningfulMotion) {
+      lastMeaningfulMotionAt = now;
+    } else if (now - lastMeaningfulMotionAt >= MOTION_INACTIVITY_MS) {
+      remoteState = RemoteState::PARKED;
+      gestureArmed = false;
+      quietSince = 0;
+      resetSessionLearning();
+      resetWakeDetector();
+      diagnostics.println("State: PARKED after motion inactivity");
     }
   }
 
