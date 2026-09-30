@@ -8,6 +8,7 @@ The remote is tuned for natural reading gestures rather than button presses:
 - Swing right-to-left to advance a page, like turning a paper page.
 - Swing left-to-right to go back.
 - Shake deliberately to wake it; three large blue flashes confirm wake-up.
+- Sleep with Bluetooth and the processor off after five idle minutes.
 - Turn it face-down to hand the connection between two paired iPads.
 - Receive live diagnostics through USB Serial or Nordic BLE UART.
 - Adapt gesture thresholds cautiously during each reading session.
@@ -51,10 +52,12 @@ library is 2.0.7.
 ## Pairing and Use
 
 1. Pair **Roy's Page Turner** in iPadOS Bluetooth settings.
-2. Shake the remote rapidly back and forth. Three strong blue flashes mean it
-   has accepted the wake gesture.
-3. Hold it calmly for a moment; page gestures are then armed with the LED off.
-4. Turn it face-down for three seconds to enter Bluetooth handoff mode. The
+2. Pick it up. The accelerometer wakes the processor, but Bluetooth remains
+   disabled until the deliberate wake gesture is confirmed.
+3. Shake the remote rapidly back and forth. Three strong blue flashes mean it
+   has accepted the gesture and resumed Bluetooth advertising.
+4. Hold it calmly for a moment; page gestures are then armed with the LED off.
+5. Turn it face-down for three seconds to enter Bluetooth handoff mode. The
    current iPad is refused while another paired iPad connects.
 
 The firmware remembers two hosts. Pairing a third host removes the oldest bond
@@ -74,6 +77,7 @@ User-facing settings are grouped near the top of the sketch. They include:
 - Bluetooth name
 - Reversed or original page direction
 - Motion-inactivity timeout and activity thresholds
+- Deep-sleep wake qualification timing
 - Page-turn sensitivity
 - Shake-to-wake thresholds and timing
 - LED timing
@@ -84,8 +88,11 @@ The included defaults were trained from recorded natural page turns, five
 deliberate wake shakes, and approximately 79 seconds of pocket walking.
 
 After five continuous minutes without meaningful movement, the remote parks
-regardless of its resting orientation. Page gestures stay disabled until the
-trained three-impulse shake wakes it again.
+regardless of its resting orientation. Bluetooth disconnects and the nRF52840
+enters System OFF. The LSM6DS3 accelerometer remains active at low power and
+wakes the processor through its INT1 hardware interrupt. Bluetooth remains
+suppressed until the trained shake is accepted; an incomplete wake attempt
+returns to System OFF after eight seconds.
 
 ## Motion Recorder
 
@@ -95,11 +102,17 @@ motion to the XIAO's internal filesystem for later playback.
 
 Uploading the recorder temporarily replaces the page-turner firmware.
 
-## Current Power Status
+## Low-Power Operation
 
-The current firmware uses shake-gated activation but still polls the IMU while
-parked. A future version will configure the LSM6DS3 motion interrupt and put the
-nRF52840 into genuine low-power sleep between wake events.
+V1.19 uses genuine nRF52840 System OFF rather than polling while parked. Before
+sleeping it disables Bluetooth and the gyroscope, configures the accelerometer's
+wake detector, disables the battery measurement divider, and forces all
+active-low LEDs off. The tested prototype wakes immediately from motion, waits
+for the deliberate shake, then reconnects to its bonded iPad.
+
+USB power suppresses System OFF so charging, uploading, and Serial diagnostics
+remain available. Charger status is accepted only while USB VBUS is present,
+avoiding false charging indications from the charger's open-drain status pin.
 
 ## License
 

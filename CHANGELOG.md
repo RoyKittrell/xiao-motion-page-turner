@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.19 - 2026-09-30
+
+- Added genuine nRF52840 System OFF after five motionless minutes.
+- Added LSM6DS3TR-C INT1 hardware motion wake on XIAO pin D18/P0.11.
+- Keeps Bluetooth suppressed until the trained shake confirms wake-up.
+- Returns incomplete wake attempts to deep sleep after eight seconds.
+- Restores normal IMU operation explicitly after a System OFF reset.
+- Fixed false battery-only charging detection from the open-drain CHG pin.
+- Forces all active-low LEDs off immediately before entering System OFF.
+
 ## 1.13 - 2026-09-29
 
 - Replaced orientation-specific table detection with motion inactivity parking.

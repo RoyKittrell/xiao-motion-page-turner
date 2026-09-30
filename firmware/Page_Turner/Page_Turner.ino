@@ -1,4 +1,4 @@
-// Page Turner V1.13 - motion-inactivity parking
+// Page Turner V1.19 - guarded deep sleep with retained LEDs forced off
 #include <bluefruit.h>
 #include <LSM6DS3.h>
 #include <Wire.h>
@@ -26,6 +26,12 @@ constexpr bool REVERSE_PAGE_DIRECTION = true;
 // parked, page gestures remain disabled until the deliberate shake-to-wake.
 constexpr uint32_t MOTION_INACTIVITY_MINUTES = 5;
 
+// After an IMU wake-up, allow this long for the deliberate three-shake
+// pattern. Random movement that does not complete the pattern returns the
+// remote to true deep sleep without reconnecting permanently.
+constexpr uint32_t WAKE_QUALIFICATION_SECONDS = 8;
+constexpr uint32_t POST_WAKE_SENSOR_GUARD_MS = 250;
+
 // Movement must cross either threshold to restart the inactivity timer.
 // These are deliberately above normal stationary IMU noise.
 constexpr float ACTIVITY_GYRO_THRESHOLD_DPS = 12.0f;
@@ -33,6 +39,8 @@ constexpr float ACTIVITY_ACCEL_DELTA_G = 0.12f;
 
 // After the wake flashes, motion is ignored until calmly held for this long.
 constexpr uint32_t PICKUP_SETTLE_MS = 400;
+// Never remain indefinitely in the solid-blue settling state.
+constexpr uint32_t PICKUP_SETTLE_TIMEOUT_MS = 3000;
 
 // Shake-to-wake values trained from Roy's five shakes and pocket-walking log.
 // Three rapid impacts are required; isolated walking impacts are ignored.
@@ -40,7 +48,7 @@ constexpr uint8_t WAKE_IMPULSE_COUNT = 3;
 constexpr float WAKE_IMPULSE_THRESHOLD_G = 3.5f;
 constexpr float WAKE_IMPULSE_RELEASE_G = 2.0f;
 constexpr float WAKE_GYRO_CONFIRM_DPS = 500.0f;
-constexpr uint32_t WAKE_IMPULSE_WINDOW_MS = 800;
+constexpr uint32_t WAKE_IMPULSE_WINDOW_MS = 1200;
 constexpr uint32_t WAKE_IMPULSE_REFRACTORY_MS = 120;
 
 // A successful shake produces three large blue flashes: "Hey Boss! I'm awake!"
@@ -62,7 +70,7 @@ constexpr float RETRY_CANDIDATE_DPS = 300.0f;
 constexpr uint32_t RETRY_WINDOW_MS = 1400;
 
 // LED preferences. Settling is solid blue; READY remains dark after wake.
-constexpr bool SHOW_SETTLING_LED = true;
+constexpr bool SHOW_SETTLING_LED = false;
 constexpr uint8_t ARMED_FLASH_COUNT = 0;
 constexpr uint32_t ARMED_FLASH_ON_MS = 150;
 constexpr uint32_t ARMED_FLASH_OFF_MS = 150;
@@ -105,9 +113,14 @@ constexpr float MAX_TURN_THRESHOLD_DPS = 450.0f;
 constexpr uint32_t WEAK_GESTURE_END_MS = 100;
 constexpr float RETRY_THRESHOLD_STEP_DPS = 6.0f;
 constexpr uint32_t CHARGE_STATUS_GPIO = 17;  // Raw Nordic pin P0.17.
+constexpr uint32_t LED_RED_GPIO = 26;        // Raw Nordic pin P0.26.
+constexpr uint32_t LED_BLUE_GPIO = 6;        // Raw Nordic pin P0.06.
+constexpr uint32_t LED_GREEN_GPIO = 30;      // Raw Nordic pin P0.30.
 constexpr float BATTERY_DIVIDER_RATIO = 2.9608f;  // 1 MOhm / 510 kOhm divider.
 constexpr float FACE_DOWN_Z_MAX_G = -0.65f;
 constexpr float FACE_DOWN_GYRO_MAX_DPS = 80.0f;
+constexpr uint8_t IMU_WAKE_THRESHOLD = 8;  // 8/64 of 2 g = about 0.25 g.
+constexpr uint8_t IMU_WAKE_DURATION = 0x00;  // Validated: first qualifying sample.
 
 // Derived timing values. Do not edit these; use the settings above.
 constexpr uint32_t MOTION_INACTIVITY_MS =
@@ -115,6 +128,8 @@ constexpr uint32_t MOTION_INACTIVITY_MS =
 constexpr uint32_t BATTERY_STATUS_INTERVAL_MS =
     BATTERY_STATUS_INTERVAL_SECONDS * 1000UL;
 constexpr uint32_t HANDOFF_WINDOW_MS = HANDOFF_WINDOW_SECONDS * 1000UL;
+constexpr uint32_t WAKE_QUALIFICATION_MS =
+    WAKE_QUALIFICATION_SECONDS * 1000UL;
 constexpr uint32_t WAKE_FLASH_CYCLE_MS =
     WAKE_FLASH_ON_MS + WAKE_FLASH_OFF_MS;
 constexpr uint32_t WAKE_FLASH_TOTAL_MS =
@@ -178,6 +193,8 @@ void onBleSecured(uint16_t connHandle);
 bool gestureArmed = false;
 uint32_t quietSince = 0;
 uint32_t pickupQuietSince = 0;
+uint32_t pickupSettlingStartedAt = 0;
+uint32_t lastSettlingDiagnosticAt = 0;
 uint32_t readyFlashStartedAt = 0;
 uint32_t lastMeaningfulMotionAt = 0;
 uint32_t lastPrintAt = 0;
@@ -189,12 +206,16 @@ uint32_t handoffFeedbackUntil = 0;
 uint32_t wakeWindowStartedAt = 0;
 uint32_t lastWakeImpulseAt = 0;
 uint32_t wakeFlashStartedAt = 0;
+uint32_t parkedAwakeStartedAt = 0;
+uint32_t wakeDetectionNotBefore = 0;
 uint8_t wakeImpulseCount = 0;
 float wakePeakGyroDps = 0.0f;
 bool wakeImpulseReady = true;
 bool blockedHostValid = false;
 bool handoffDisconnectIssued = false;
 bool faceDownLatched = false;
+bool wokeFromSystemOff = false;
+bool bluetoothSuppressedForWake = false;
 ble_gap_addr_t blockedHost = {};
 HostSlots hostSlots = {};
 RemoteState remoteState = RemoteState::PARKED;
@@ -457,7 +478,75 @@ bool updateShakeToWake(float accelMagnitude, float gyroMagnitude,
 bool isBatteryCharging() {
   // The BQ25101 CHG output is active-low. Raw GPIO access is required because
   // Arduino pin 17 is not the same thing as Nordic pin P0.17 on this board.
-  return (NRF_P0->IN & (1UL << CHARGE_STATUS_GPIO)) == 0;
+  // CHG is open-drain and can float LOW on battery power, so it is meaningful
+  // only while USB VBUS is actually present.
+  const bool usbPowered =
+      (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+  const bool chargePinLow =
+      (NRF_P0->IN & (1UL << CHARGE_STATUS_GPIO)) == 0;
+  return usbPowered && chargePinLow;
+}
+
+bool isUsbPowered() {
+  return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+}
+
+void enterImuDeepSleep() {
+  if (isUsbPowered() || isBatteryCharging()) {
+    return;
+  }
+
+  diagnostics.println("Deep sleep: IMU interrupt armed");
+  delay(30);
+  Bluefruit.Advertising.stop();
+  if (Bluefruit.connected()) {
+    Bluefruit.disconnect(Bluefruit.connHandle());
+    delay(80);
+  }
+
+  // Leave only the accelerometer running at 26 Hz in low-power mode. Its
+  // wake-up detector drives INT1, physically routed to nRF52840 P0.11 (D18).
+  imu.writeRegister(LSM6DS3_ACC_GYRO_MD1_CFG, 0x00);
+  imu.writeRegister(LSM6DS3_ACC_GYRO_CTRL2_G, 0x00);
+  imu.writeRegister(LSM6DS3_ACC_GYRO_CTRL1_XL, 0x20);
+  imu.writeRegister(LSM6DS3_ACC_GYRO_WAKE_UP_THS, IMU_WAKE_THRESHOLD);
+  imu.writeRegister(LSM6DS3_ACC_GYRO_WAKE_UP_DUR, IMU_WAKE_DURATION);
+  // LSM6DS3TR-C bit 7 globally enables basic interrupts. V1.14 omitted this
+  // bit, so INT1 never asserted; the awake diagnostic validated 0x81.
+  imu.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x81);  // Enable + latch INT1.
+  imu.writeRegister(LSM6DS3_ACC_GYRO_MD1_CFG, 0x20);   // Wake-up on INT1.
+
+  uint8_t wakeSource = 0;
+  imu.readRegister(&wakeSource, LSM6DS3_ACC_GYRO_WAKE_UP_SRC);
+  delay(20);
+
+  // Disable the battery measurement divider before System OFF. systemOff()
+  // configures D18 as a high-level GPIO wake source and does not return.
+  digitalWrite(VBAT_ENABLE, HIGH);
+
+  // System OFF retains GPIO state. Force each active-low LED output HIGH as
+  // the final operation so disconnect callbacks and peripheral shutdown cannot
+  // leave the blue LED illuminated for the entire sleep period.
+  nrf_gpio_cfg_output(LED_RED_GPIO);
+  nrf_gpio_cfg_output(LED_BLUE_GPIO);
+  nrf_gpio_cfg_output(LED_GREEN_GPIO);
+  nrf_gpio_pin_set(LED_RED_GPIO);
+  nrf_gpio_pin_set(LED_BLUE_GPIO);
+  nrf_gpio_pin_set(LED_GREEN_GPIO);
+  systemOff(PIN_LSM6DS3TR_C_INT1, HIGH);
+}
+
+void restoreActiveImuMode() {
+  // The LSM6DS3 remains powered while the nRF52840 is in System OFF, so its
+  // wake routing and latched source survive the processor reset. Disable that
+  // routing explicitly after imu.begin() restores normal accel/gyro sampling.
+  imu.writeRegister(LSM6DS3_ACC_GYRO_MD1_CFG, 0x00);
+  imu.writeRegister(LSM6DS3_ACC_GYRO_TAP_CFG1, 0x00);
+  uint8_t staleWakeSource = 0;
+  imu.readRegister(&staleWakeSource, LSM6DS3_ACC_GYRO_WAKE_UP_SRC);
+
+  // Remove the GPIO level-sense configuration installed by systemOff().
+  pinMode(PIN_LSM6DS3TR_C_INT1, INPUT_PULLDOWN);
 }
 
 float readBatteryVoltage() {
@@ -757,8 +846,9 @@ void sendArrow(uint8_t key, const char *label) {
 }
 
 void setup() {
+  wokeFromSystemOff = (readResetReason() & POWER_RESETREAS_OFF_Msk) != 0;
   Serial.begin(115200);
-  delay(600);
+  delay(wokeFromSystemOff ? 50 : 600);
 
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
@@ -783,6 +873,7 @@ void setup() {
       delay(1000);
     }
   }
+  restoreActiveImuMode();
 
   Bluefruit.begin();
   bluetoothReady = true;
@@ -800,11 +891,27 @@ void setup() {
   bleUart.begin();
   startAdvertising();
 
-  diagnostics.println("Roy Page Turner V1.13 ready");
+  diagnostics.println("Roy Page Turner V1.19 experimental ready");
   if (Serial) {
     printBatteryStatus();
   }
   diagnostics.println("State: PARKED. Shake three times rapidly to wake.");
+  parkedAwakeStartedAt = millis();
+  if (wokeFromSystemOff) {
+    // The hardware wake event counts as the first of the trained impulses.
+    // Two more strong, rotating impacts must follow after the IMU settles.
+    wakeImpulseCount = 1;
+    wakeWindowStartedAt = millis();
+    lastWakeImpulseAt = millis();
+    wakeImpulseReady = true;
+    wakeDetectionNotBefore = millis() + POST_WAKE_SENSOR_GUARD_MS;
+
+    // A random bump may wake the processor, but it must not reconnect an iPad.
+    // Advertising resumes only after the deliberate shake is accepted.
+    Bluefruit.Advertising.stop();
+    bluetoothSuppressedForWake = true;
+    diagnostics.println("IMU motion wake: waiting for deliberate shake");
+  }
 }
 
 void loop() {
@@ -859,22 +966,38 @@ void loop() {
   observeGesture(gz);
 
   if (remoteState == RemoteState::PARKED) {
-    if (!isBatteryCharging() &&
+    if (now >= wakeDetectionNotBefore && !isBatteryCharging() &&
         updateShakeToWake(accelMagnitude, gyroMagnitude, now)) {
       remoteState = RemoteState::WAKE_FLASHING;
       wakeFlashStartedAt = now;
       gestureArmed = false;
       clearRetryTracking();
+      if (bluetoothSuppressedForWake) {
+        startAdvertising();
+        bluetoothSuppressedForWake = false;
+      }
       diagnostics.println("Shake accepted: HEY BOSS! I'M AWAKE!");
+    } else if (!isUsbPowered() &&
+               now - parkedAwakeStartedAt >= WAKE_QUALIFICATION_MS) {
+      enterImuDeepSleep();
     }
   } else if (remoteState == RemoteState::WAKE_FLASHING) {
     if (now - wakeFlashStartedAt >= WAKE_FLASH_TOTAL_MS) {
       remoteState = RemoteState::PICKUP_SETTLING;
       pickupQuietSince = 0;
+      pickupSettlingStartedAt = now;
+      lastSettlingDiagnosticAt = 0;
       diagnostics.println("State: SETTLING (gestures ignored)");
     }
   } else if (remoteState == RemoteState::PICKUP_SETTLING) {
     const bool calmlyHeld = gyroMagnitude <= SETTLE_GYRO_MAX_DPS;
+    if (lastSettlingDiagnosticAt == 0 ||
+        now - lastSettlingDiagnosticAt >= 1000) {
+      lastSettlingDiagnosticAt = now;
+      diagnostics.print("Settling gyro: ");
+      diagnostics.print(gyroMagnitude, 1);
+      diagnostics.println(" dps");
+    }
     if (calmlyHeld) {
       if (pickupQuietSince == 0) {
         pickupQuietSince = now;
@@ -889,6 +1012,16 @@ void loop() {
     } else {
       pickupQuietSince = 0;
     }
+
+    if (remoteState == RemoteState::PICKUP_SETTLING &&
+        now - pickupSettlingStartedAt >= PICKUP_SETTLE_TIMEOUT_MS) {
+      remoteState = RemoteState::READY;
+      gestureArmed = true;
+      quietSince = now;
+      readyFlashStartedAt = now;
+      lastMeaningfulMotionAt = now;
+      diagnostics.println("State: READY (settling timeout fail-safe)");
+    }
   } else {
     if (meaningfulMotion) {
       lastMeaningfulMotionAt = now;
@@ -899,6 +1032,7 @@ void loop() {
       resetSessionLearning();
       resetWakeDetector();
       diagnostics.println("State: PARKED after motion inactivity");
+      enterImuDeepSleep();
     }
   }
 
